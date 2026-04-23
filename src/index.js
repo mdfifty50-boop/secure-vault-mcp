@@ -4,15 +4,32 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync, chmodSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { secrets, tokens, auditLog } from './db.js';
 
 // ═══════════════════════════════════════════
-// IN-MEMORY ENCRYPTED VAULT
+// PERSISTENT MASTER KEY
 // ═══════════════════════════════════════════
 
-const MASTER_KEY = randomBytes(32);
-const secrets = new Map();     // name -> { encrypted, iv, tag, service, rotation_policy, created_at, rotated_at }
-const tokens = new Map();      // token_id -> { agent_id, secret_name, scope, expires_at }
-const auditLog = [];           // { timestamp, agent_id, secret_name, action, detail }
+const VAULT_DIR = join(homedir(), '.secure-vault-mcp');
+mkdirSync(VAULT_DIR, { recursive: true });
+
+const MASTER_KEY_PATH = join(VAULT_DIR, 'master.key');
+
+let MASTER_KEY;
+if (existsSync(MASTER_KEY_PATH)) {
+  MASTER_KEY = Buffer.from(readFileSync(MASTER_KEY_PATH, 'utf8').trim(), 'hex');
+} else {
+  MASTER_KEY = randomBytes(32);
+  writeFileSync(MASTER_KEY_PATH, MASTER_KEY.toString('hex'), 'utf8');
+  chmodSync(MASTER_KEY_PATH, 0o600);
+}
+
+// ═══════════════════════════════════════════
+// ENCRYPTION HELPERS
+// ═══════════════════════════════════════════
 
 function encrypt(plaintext) {
   const iv = randomBytes(12);
@@ -30,7 +47,6 @@ function decrypt(record) {
 
 function logAudit(agent_id, secret_name, action, detail = '') {
   auditLog.push({ timestamp: new Date().toISOString(), agent_id, secret_name, action, detail });
-  if (auditLog.length > 10000) auditLog.shift();
 }
 
 // Leak detection patterns
@@ -73,12 +89,14 @@ server.tool(
     rotation_policy: z.enum(['none', 'daily', 'weekly', 'monthly']).default('none').describe('Automatic rotation reminder policy'),
   },
   async (params) => {
+    const now = new Date().toISOString();
+    const existing = secrets.get(params.name);
     const record = {
       ...encrypt(params.value),
       service: params.service,
       rotation_policy: params.rotation_policy,
-      created_at: new Date().toISOString(),
-      rotated_at: new Date().toISOString(),
+      created_at: existing ? existing.created_at : now,
+      rotated_at: now,
     };
     secrets.set(params.name, record);
     logAudit('system', params.name, 'store', `service=${params.service} rotation=${params.rotation_policy}`);
@@ -114,13 +132,11 @@ server.tool(
   },
   async (params) => {
     // Find a secret for this service
-    let secretName = null;
-    for (const [name, record] of secrets) {
-      if (record.service === params.service) { secretName = name; break; }
-    }
-    if (!secretName) {
+    const matches = secrets.getByService(params.service);
+    if (!matches.length) {
       return { content: [{ type: 'text', text: JSON.stringify({ error: true, message: `No secret found for service "${params.service}"` }) }] };
     }
+    const secretName = matches[0].name;
 
     const tokenId = `svt_${randomBytes(24).toString('hex')}`;
     const expiresAt = new Date(Date.now() + params.ttl_seconds * 1000).toISOString();
@@ -161,9 +177,10 @@ server.tool(
     new_value: z.string().min(1).describe('The new secret value to replace the old one'),
   },
   async (params) => {
+    const matches = secrets.getByService(params.service);
     const rotated = [];
-    for (const [name, record] of secrets) {
-      if (record.service !== params.service) continue;
+
+    for (const record of matches) {
       const updated = {
         ...encrypt(params.new_value),
         service: record.service,
@@ -171,15 +188,16 @@ server.tool(
         created_at: record.created_at,
         rotated_at: new Date().toISOString(),
       };
-      secrets.set(name, updated);
-      rotated.push(name);
-      logAudit('system', name, 'rotate', `service=${params.service}`);
+      secrets.set(record.name, updated);
+      rotated.push(record.name);
+      logAudit('system', record.name, 'rotate', `service=${params.service}`);
     }
 
     // Invalidate tokens pointing to rotated secrets
     let invalidated = 0;
-    for (const [tokenId, token] of tokens) {
-      if (rotated.includes(token.secret_name)) {
+    for (const name of rotated) {
+      const tokenIds = tokens.tokensBySecret(name);
+      for (const tokenId of tokenIds) {
         tokens.delete(tokenId);
         invalidated++;
       }
@@ -217,11 +235,10 @@ server.tool(
     const rangeMs = { '1h': 3600e3, '6h': 21600e3, '24h': 86400e3, '7d': 604800e3, all: Infinity };
     const cutoff = now - (rangeMs[params.time_range] ?? 86400e3);
 
-    const entries = auditLog.filter((e) => {
-      if (new Date(e.timestamp).getTime() < cutoff) return false;
-      if (params.agent_id && e.agent_id !== params.agent_id) return false;
-      if (params.secret_name && e.secret_name !== params.secret_name) return false;
-      return true;
+    const { total, entries } = auditLog.query({
+      cutoff,
+      agent_id: params.agent_id ?? null,
+      secret_name: params.secret_name ?? null,
     });
 
     return {
@@ -229,8 +246,8 @@ server.tool(
         type: 'text',
         text: JSON.stringify({
           time_range: params.time_range,
-          total_entries: entries.length,
-          entries: entries.slice(-100),
+          total_entries: total,
+          entries,
         }, null, 2),
       }],
     };
@@ -337,16 +354,10 @@ server.resource(
   'secrets',
   'secure-vault://secrets',
   async () => {
-    const listing = [];
-    for (const [name, record] of secrets) {
-      listing.push({
-        name,
-        service: record.service,
-        rotation_policy: record.rotation_policy,
-        created_at: record.created_at,
-        rotated_at: record.rotated_at,
-      });
-    }
+    const allSecrets = secrets.all();
+    const listing = allSecrets.map(({ name, service, rotation_policy, created_at, rotated_at }) => ({
+      name, service, rotation_policy, created_at, rotated_at,
+    }));
 
     return {
       contents: [{
@@ -354,7 +365,7 @@ server.resource(
         mimeType: 'application/json',
         text: JSON.stringify({
           total_secrets: listing.length,
-          active_tokens: tokens.size,
+          active_tokens: tokens.size(),
           secrets: listing,
           generated_at: new Date().toISOString(),
         }, null, 2),
