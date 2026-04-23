@@ -1,0 +1,43 @@
+{
+  "serverInfo": {
+    "name": "secure-vault-mcp",
+    "version": "0.1.0",
+    "description": "MCP server for agent-native secrets management — store, rotate, and inject secrets without agents seeing raw values",
+    "author": "THRONE AI",
+    "license": "MIT",
+    "homepage": "https://github.com/mdfifty50-boop/secure-vault-mcp",
+    "repository": "https://github.com/mdfifty50-boop/secure-vault-mcp"
+  },
+  "capabilities": {
+    "tools": [
+      { "name": "store_secret", "description": "Store an encrypted secret with optional rotation policy" },
+      { "name": "get_agent_token", "description": "Issue a short-lived scoped token for an agent — agent never sees raw secret" },
+      { "name": "rotate_secrets", "description": "Rotate all secrets for a service and invalidate old tokens" },
+      { "name": "audit_secret_access", "description": "View who accessed what secrets over a time range" },
+      { "name": "scan_config_for_leaks", "description": "Scan config text for exposed API keys, tokens, and passwords" },
+      { "name": "inject_secret_to_request", "description": "Return a request with the secret injected — agent never handles raw value" }
+    ],
+    "resources": [
+      { "uri": "secure-vault://secrets", "description": "List all stored secret names with metadata (no raw values)" }
+    ]
+  },
+  "categories": ["security", "secrets-management", "developer-tools", "agentic-engineering"],
+  "keywords": ["secrets", "vault", "api-keys", "token-broker", "credential-rotation", "leak-detection", "agent-security"],
+  "pricing": {
+    "free_tier": true,
+    "free_limit": "Unlimited secrets, in-memory only",
+    "pro": "$99/month — persistent storage, rotation webhooks, multi-tenant",
+    "enterprise": "$499/month — HSM integration, SSO, compliance audit logs"
+  },
+  "install": {
+    "npm": "npx secure-vault-mcp",
+    "claude_desktop": {
+      "mcpServers": {
+        "secure-vault": {
+          "command": "npx",
+          "args": ["secure-vault-mcp"]
+        }
+      }
+    }
+  }
+}
